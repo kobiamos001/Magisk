@@ -1,4 +1,4 @@
-use super::connect::SuAppContext;
+use supe00r::connect::SuAppContext;
 use super::db::RootSettings;
 use crate::daemon::{AID_ROOT, AID_SHELL, MagiskD, to_app_id};
 use crate::db::{DbSettings, MultiuserMode, RootAccess};
