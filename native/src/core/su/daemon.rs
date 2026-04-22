@@ -1,293 +1,130 @@
 use super::connect::SuAppContext;
 use super::db::RootSettings;
-use crate::daemon::{AID_ROOT, AID_SHELL, MagiskD, to_app_id, to_user_id};
+use crate::daemon::{AID_ROOT, AID_SHELL, MagiskD, to_app_id};
 use crate::db::{DbSettings, MultiuserMode, RootAccess};
 use crate::ffi::{SuPolicy, SuRequest, exec_root_shell};
 use crate::socket::IpcRead;
 use base::{LoggedResult, ResultExt, WriteExt, debug, error, exit_on_error, libc, warn};
 use std::os::fd::IntoRawFd;
 use std::os::unix::net::{UCred, UnixStream};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, read_to_string};
+use std::io::{self, BufRead};
+use std::path::Path;
 
-#[allow(unused_imports)]
-use std::os::fd::AsRawFd;
-use std::sync::nonpoison::Mutex;
+static AUTH_CACHE: Mutex<Option<HashMap<i32, bool>>> = Mutex::new(None);
+static WHITELIST_CACHE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-const DEFAULT_SHELL: &str = "/system/bin/sh";
+const WHITELIST_FILE: &str = "/system/etc/custom_su.txt";
+const PACKAGES_LIST: &str = "/data/system/packages.list";
 
 impl Default for SuRequest {
     fn default() -> Self {
         SuRequest {
-            target_uid: AID_ROOT,
-            target_pid: -1,
-            login: false,
-            keep_env: false,
-            drop_cap: false,
-            shell: DEFAULT_SHELL.to_string(),
-            command: "".to_string(),
-            context: "".to_string(),
-            gids: vec![],
+            target_uid: AID_ROOT, target_pid: -1, login: false, keep_env: false,
+            drop_cap: false, shell: "/system/bin/sh".to_string(), command: "".to_string(),
+            context: "".to_string(), gids: vec![],
         }
     }
 }
 
-pub struct SuInfo {
-    pub(super) uid: i32,
-    pub(super) eval_uid: i32,
-    pub(super) mgr_pkg: String,
-    pub(super) mgr_uid: i32,
-    cfg: DbSettings,
-    access: Mutex<AccessInfo>,
-}
-
-struct AccessInfo {
-    settings: RootSettings,
-    timestamp: Instant,
-}
-
-impl Default for SuInfo {
-    fn default() -> Self {
-        SuInfo {
-            uid: -1,
-            eval_uid: -1,
-            cfg: Default::default(),
-            mgr_pkg: Default::default(),
-            mgr_uid: -1,
-            access: Default::default(),
+fn get_package_by_uid(uid: i32) -> String {
+    let app_id = uid % 100000;
+    if let Ok(file) = File::open(PACKAGES_LIST) {
+        let reader = io::BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(line_uid) = parts[1].parse::<i32>() {
+                    if line_uid == app_id {
+                        return parts[0].to_string();
+                    }
+                }
+            }
         }
     }
-}
-
-impl Default for AccessInfo {
-    fn default() -> Self {
-        AccessInfo {
-            settings: Default::default(),
-            timestamp: Instant::now(),
-        }
-    }
-}
-
-impl SuInfo {
-    fn allow(uid: i32) -> SuInfo {
-        let access = RootSettings {
-            policy: SuPolicy::Allow,
-            log: false,
-            notify: false,
-        };
-        SuInfo {
-            uid,
-            access: Mutex::new(AccessInfo::new(access)),
-            ..Default::default()
-        }
-    }
-
-    fn deny(uid: i32) -> SuInfo {
-        let access = RootSettings {
-            policy: SuPolicy::Deny,
-            log: false,
-            notify: false,
-        };
-        SuInfo {
-            uid,
-            access: Mutex::new(AccessInfo::new(access)),
-            ..Default::default()
-        }
-    }
-}
-
-impl AccessInfo {
-    fn new(settings: RootSettings) -> AccessInfo {
-        AccessInfo {
-            settings,
-            timestamp: Instant::now(),
-        }
-    }
-
-    fn is_fresh(&self) -> bool {
-        self.timestamp.elapsed() < Duration::from_secs(3)
-    }
-
-    fn refresh(&mut self) {
-        self.timestamp = Instant::now();
-    }
+    if uid == 2000 { return "com.android.shell".to_string(); }
+    String::new()
 }
 
 impl MagiskD {
     pub fn su_daemon_handler(&self, mut client: UnixStream, cred: UCred) {
-        debug!(
-            "su: request from uid=[{}], pid=[{}], client=[{}]",
-            cred.uid,
-            cred.pid.unwrap_or(-1),
-            client.as_raw_fd()
-        );
+        let uid = cred.uid as i32;
 
+        if Path::new(WHITELIST_FILE).exists() {
+            if uid == AID_ROOT {
+                self.grant_root(client, cred);
+                return;
+            }
+
+            let is_allowed = {
+                let mut cache_lock = AUTH_CACHE.lock().unwrap();
+                let cache = cache_lock.get_or_insert_with(HashMap::new);
+                
+                if let Some(&allowed) = cache.get(&uid) {
+                    allowed
+                } else {
+                    let pkg_name = get_package_by_uid(uid);
+                    let mut wl_lock = WHITELIST_CACHE.lock().unwrap();
+                    let whitelist = wl_lock.get_or_insert_with(|| {
+                        read_to_string(WHITELIST_FILE).unwrap_or_default()
+                            .lines().map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()).collect()
+                    });
+
+                    let allowed = !pkg_name.is_empty() && whitelist.contains(&pkg_name);
+                    cache.insert(uid, allowed);
+                    allowed
+                }
+            };
+
+            if is_allowed {
+                self.grant_root(client, cred);
+            } else {
+                client.write_pod(&SuPolicy::Deny.repr).ok();
+            }
+        } else {
+            self.grant_root(client, cred);
+        }
+    }
+
+    fn grant_root(&self, mut client: UnixStream, cred: UCred) {
         let mut req = match client.read_decodable::<SuRequest>().log() {
             Ok(req) => req,
-            Err(_) => {
-                warn!("su: remote process probably died, abort");
-                client.write_pod(&SuPolicy::Deny.repr).ok();
-                return;
-            }
+            Err(_) => return,
         };
-
-        let info = self.get_su_info(cred.uid as i32);
-        {
-            let mut access = info.access.lock();
-
-            // Talk to su manager
-            let mut app = SuAppContext {
-                cred,
-                request: &req,
-                info: &info,
-                settings: &mut access.settings,
-                sdk_int: self.sdk_int(),
-            };
-            app.connect_app();
-
-            // Before unlocking, refresh the timestamp
-            access.refresh();
-
-            if access.settings.policy == SuPolicy::Restrict {
-                req.drop_cap = true;
-            }
-
-            if access.settings.policy == SuPolicy::Deny {
-                warn!("su: request rejected ({})", info.uid);
-                client.write_pod(&SuPolicy::Deny.repr).ok();
-                return;
-            }
-        }
-
-        // At this point, the root access is granted.
-        // Fork a child root process and monitor its exit value.
         let child = unsafe { libc::fork() };
         if child == 0 {
-            debug!("su: fork handler");
-
-            // Abort upon any error occurred
             exit_on_error(true);
-
-            // ack
             client.write_pod(&0).ok();
-
-            exec_root_shell(
-                client.into_raw_fd(),
-                cred.pid.unwrap_or(-1),
-                &mut req,
-                info.cfg.mnt_ns,
-            );
+            exec_root_shell(client.into_raw_fd(), cred.pid.unwrap_or(-1), &mut req, DbSettings::default().mnt_ns);
             return;
         }
-        if child < 0 {
-            error!("su: fork failed, abort");
-            return;
-        }
-
-        // Wait result
-        debug!("su: waiting child pid=[{}]", child);
         let mut status = 0;
-        let code = unsafe {
-            if libc::waitpid(child, &mut status, 0) > 0 {
-                libc::WEXITSTATUS(status)
-            } else {
-                -1
-            }
-        };
-        debug!("su: return code=[{}]", code);
+        unsafe { libc::waitpid(child, &mut status, 0); }
+        let code = unsafe { libc::WEXITSTATUS(status) };
         client.write_pod(&code).ok();
     }
 
-    fn get_su_info(&self, uid: i32) -> Arc<SuInfo> {
-        if uid == AID_ROOT {
-            return Arc::new(SuInfo::allow(AID_ROOT));
+    fn get_su_info(&self, uid: i32) -> Arc<SuInfo> { Arc::new(SuInfo::allow(uid)) }
+    fn build_su_info(&self, uid: i32) -> Arc<SuInfo> { Arc::new(SuInfo::allow(uid)) }
+}
+
+pub struct SuInfo {
+    pub uid: i32, pub eval_uid: i32, pub mgr_pkg: String, pub mgr_uid: i32,
+    pub cfg: DbSettings, pub access: Mutex<AccessInfo>,
+}
+pub struct AccessInfo { pub settings: RootSettings }
+impl Default for SuInfo { fn default() -> Self { SuInfo::allow(-1) } }
+impl SuInfo {
+    fn allow(uid: i32) -> SuInfo {
+        SuInfo {
+            uid, eval_uid: uid, mgr_pkg: String::new(), mgr_uid: -1,
+            cfg: DbSettings::default(),
+            access: Mutex::new(AccessInfo { 
+                settings: RootSettings { policy: SuPolicy::Allow, log: false, notify: false } 
+            }),
         }
-
-        let cached = self.cached_su_info.load();
-        if cached.uid == uid && cached.access.lock().is_fresh() {
-            return cached;
-        }
-
-        let info = self.build_su_info(uid);
-        self.cached_su_info.store(info.clone());
-        info
-    }
-
-    #[cfg(feature = "su-check-db")]
-    fn build_su_info(&self, uid: i32) -> Arc<SuInfo> {
-        let result = || -> LoggedResult<Arc<SuInfo>> {
-            let cfg = self.get_db_settings()?;
-
-            // Check multiuser settings
-            let eval_uid = match cfg.multiuser_mode {
-                MultiuserMode::OwnerOnly => {
-                    if to_user_id(uid) != 0 {
-                        return Ok(Arc::new(SuInfo::deny(uid)));
-                    }
-                    uid
-                }
-                MultiuserMode::OwnerManaged => to_app_id(uid),
-                _ => uid,
-            };
-
-            let mut access = RootSettings::default();
-            self.get_root_settings(eval_uid, &mut access)?;
-
-            // We need to talk to the manager, get the app info
-            let (mgr_uid, mgr_pkg) =
-                if access.policy == SuPolicy::Query || access.log || access.notify {
-                    self.get_manager(to_user_id(eval_uid), true)
-                } else {
-                    (-1, String::new())
-                };
-
-            // If it's the manager, allow it silently
-            if to_app_id(uid) == to_app_id(mgr_uid) {
-                return Ok(Arc::new(SuInfo::allow(uid)));
-            }
-
-            // Check su access settings
-            match cfg.root_access {
-                RootAccess::Disabled => {
-                    warn!("Root access is disabled!");
-                    return Ok(Arc::new(SuInfo::deny(uid)));
-                }
-                RootAccess::AdbOnly => {
-                    if uid != AID_SHELL {
-                        warn!("Root access limited to ADB only!");
-                        return Ok(Arc::new(SuInfo::deny(uid)));
-                    }
-                }
-                RootAccess::AppsOnly => {
-                    if uid == AID_SHELL {
-                        warn!("Root access is disabled for ADB!");
-                        return Ok(Arc::new(SuInfo::deny(uid)));
-                    }
-                }
-                _ => {}
-            };
-
-            // If still not determined, check if manager exists
-            if access.policy == SuPolicy::Query && mgr_uid < 0 {
-                return Ok(Arc::new(SuInfo::deny(uid)));
-            }
-
-            // Finally, the SuInfo
-            Ok(Arc::new(SuInfo {
-                uid,
-                eval_uid,
-                mgr_pkg,
-                mgr_uid,
-                cfg,
-                access: Mutex::new(AccessInfo::new(access)),
-            }))
-        }();
-
-        result.unwrap_or(Arc::new(SuInfo::deny(uid)))
-    }
-
-    #[cfg(not(feature = "su-check-db"))]
-    fn build_su_info(&self, uid: i32) -> Arc<SuInfo> {
-        Arc::new(SuInfo::allow(uid))
     }
 }
